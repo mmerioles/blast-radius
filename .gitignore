@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+output.jsonl
+stderr.txt
+score_*.txt

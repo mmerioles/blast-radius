@@ -1,0 +1,41 @@
+name: Benchmark selector
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image (same as the scorer, linux/amd64)
+        run: |
+          start=$(date +%s)
+          make build
+          echo "build took $(( $(date +%s) - start ))s (limit 600s)"
+
+      - name: Run 3 times under the scorer's limits and score
+        run: |
+          set -o pipefail
+          for i in 1 2 3; do
+            start=$(date +%s)
+            docker run --rm --platform linux/amd64 --network none --cpus 2 \
+              --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+              --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+              --volume $PWD/sample/commits:/data/commits:ro \
+              --volume $PWD/sample/tests.json:/data/tests.json:ro \
+              blast-radius-entry > output.jsonl 2> stderr.txt
+            echo "run $i wall $(( $(date +%s) - start ))s (limit 180s)"
+            grep -E "fallback|error|Traceback|done in" stderr.txt || true
+            cpu=$(sed -n 's/^BR_CPU_SECONDS=//p' stderr.txt | tail -1)
+            echo "container cpu: ${cpu}s"
+            python3 score.py sample sample/answers.json output.jsonl --cpu-seconds "${cpu:-0}" | tee score_$i.txt
+          done
+
+      - name: Selector log (last run)
+        if: always()
+        run: cat stderr.txt | grep -v "Unable to set\|unsupported syntax\|Falling back" | tail -80
