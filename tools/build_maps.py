@@ -22,7 +22,9 @@ MIN_CASE_S = 0.05
 T0 = time.monotonic()
 # The image build has 10 minutes in total; optional passes are skipped when slow.
 BUDGET = float(os.environ.get("BR_MAP_BUDGET", "330"))
-REVERSE = [False]  # keep per-case maps only for tests worth filtering
+REVERSE = [False]
+VPROF = [None]
+order_dep_ran = [False]  # keep per-case maps only for tests worth filtering
 
 CO_OPTIMIZED = 0x0001
 
@@ -472,34 +474,47 @@ def _profile_shard(shard_tests, out_path):
         t = type(x)
         return t in SAFE or t.__eq__ in PURE_EQ
 
-    def brc(nid, op, a, b):
-        if op == 0 or op == 1:
-            r = a is b
+    NUM = (int, float, bool)
+    PRIM = (int, float, bool, str, bytes)
+
+    def observe(nid, a, b, r_is=None, r_eq=None):
+        """Edit-agnostic observation of one evaluation: identity, equality, order."""
+        i = (a is b) if r_is is None else r_is
+        if r_eq is None:
             if safe(a) and safe(b):
                 try:
                     e = a == b
-                    if e is not r:
-                        cur.add((nid, "D"))
+                    r_eq = e if isinstance(e, bool) else None
                 except Exception:
-                    cur.add((nid, "D"))
-            else:
-                cur.add((nid, "D"))
-            return r if op == 0 else not r
-        if op == 2 or op == 3:
-            r = (a == b) if op == 2 else (a != b)
-            i = a is b
-            if not isinstance(r, bool) or (r if op == 2 else not r) is not i:
-                cur.add((nid, "D"))
+                    r_eq = None
+        o = "u"
+        ta, tb = type(a), type(b)
+        if ta in PRIM and tb in PRIM and (ta is tb or (ta in NUM and tb in NUM)):
+            try:
+                o = "l" if a < b else ("g" if a > b else ("e" if a == b else "u"))
+            except Exception:
+                o = "u"
+        cur.add((nid, f"{int(i)}{'u' if r_eq is None else int(r_eq)}{o}"))
+
+    def brc(nid, op, a, b):
+        if op == 0:
+            r = a is b
+            observe(nid, a, b, r_is=r)
+            return r
+        if op == 1:
+            r = a is not b
+            observe(nid, a, b, r_is=not r)
+            return r
+        if op == 2:
+            r = a == b
+            observe(nid, a, b, r_eq=r if isinstance(r, bool) else None)
+            return r
+        if op == 3:
+            r = a != b
+            observe(nid, a, b, r_eq=(not r) if isinstance(r, bool) else None)
             return r
         r = (a < b) if op == 4 else (a <= b) if op == 5 else (a > b) if op == 6 else (a >= b)
-        if safe(a) and safe(b):
-            try:
-                if a == b:
-                    cur.add((nid, "E"))
-            except Exception:
-                cur.add((nid, "E"))
-        else:
-            cur.add((nid, "E"))
+        observe(nid, a, b)
         return r
 
     builtins.__brc__ = brc
@@ -544,6 +559,8 @@ def _profile_shard(shard_tests, out_path):
 
     sync = _sync_executor()
     by_class, order = {}, []
+    if os.environ.get("BR_VPROF_REVERSE") == "1":
+        shard_tests = list(reversed(shard_tests))
     for t in shard_tests:
         path, cls, meth = t["id"].split("::")
         key = (path[:-3].replace("/", "."), cls)
@@ -552,7 +569,7 @@ def _profile_shard(shard_tests, out_path):
             order.append(key)
         by_class[key].append((t["number"], meth))
     flags = {}
-    bad = 0
+    bad = 0  # mask of tests that failed under instrumentation
     for mod, cls in order:
         try:
             __import__(mod)
@@ -573,9 +590,9 @@ def _profile_shard(shard_tests, out_path):
                 klass(meth).run(res)
             except BaseException:
                 pass
-            if res.errors or res.failures:
-                bad += 1
             bit = 1 << num
+            if res.errors or res.failures:
+                bad |= bit
             for k in cur:
                 flags[k] = flags.get(k, 0) | bit
         try:
@@ -588,6 +605,52 @@ def _profile_shard(shard_tests, out_path):
 
 
 def value_profile_pass():
+    """Two independent runs (different hash seed and test order). Comparisons whose
+    observations differ between the runs are unstable and get no reduction."""
+    import subprocess
+
+    runs = []
+    for seed, rev in (("11", "0"), ("29", "1")):
+        out = OUT + f".vprof{seed}"
+        env = dict(os.environ, PYTHONHASHSEED=seed, BR_VPROF_REVERSE=rev)
+        r = subprocess.run([sys.executable, os.path.abspath(__file__), ROOT, sys.argv[2], OUT, str(SHARDS),
+                            "--vprof-run", out], env=env)
+        if r.returncode != 0 or not os.path.exists(out):
+            return None
+        with open(out, "rb") as f:
+            runs.append(pickle.load(f))
+        os.remove(out)
+    if any(x is None for x in runs):
+        return None
+    print(f"value profile: untrusted tests {bin(runs[0]['bad'] | runs[1]['bad']).count('1')}", file=sys.stderr)
+    a, b = runs
+    # tests that failed under instrumentation in either run are untrusted: they are
+    # kept for every comparison change ("uuu" can never prove agreement)
+    untrusted = a["bad"] | b["bad"]
+    if bin(untrusted).count("1") > 20:
+        return None
+    nodes = a["nodes"] & b["nodes"]
+    unstable = set()
+    keys = set(a["flags"]) | set(b["flags"])
+    for k in keys:
+        fa = {lab: m & ~untrusted for lab, m in a["flags"].get(k, {}).items()}
+        fb = {lab: m & ~untrusted for lab, m in b["flags"].get(k, {}).items()}
+        if {x: y for x, y in fa.items() if y} != {x: y for x, y in fb.items() if y}:
+            unstable.add(k)
+    nodes = frozenset(n for n in nodes if n not in unstable)
+    flags = {}
+    for k in nodes:
+        d = dict(a["flags"].get(k, {}))
+        for lab, m in b["flags"].get(k, {}).items():
+            d[lab] = d.get(lab, 0) | m
+        if untrusted:
+            d["uuu"] = d.get("uuu", 0) | untrusted
+        flags[k] = d
+    print(f"value profile: {len(nodes)} stable comparisons ({len(unstable)} unstable dropped)", file=sys.stderr)
+    return {"nodes": nodes, "obs": flags}
+
+
+def value_profile_run(out_path):
     shards = [[] for _ in range(SHARDS)]
     loads = [0.0] * SHARDS
     groups = {}
@@ -617,17 +680,19 @@ def value_profile_pass():
             with open(f"{tmp}{i}", "rb") as f:
                 nodes, flags, b = pickle.load(f)
             os.remove(f"{tmp}{i}")
-            bad += b
+            bad |= b
             instrumented.update(nodes)
-            for (nid, fl), mask in flags.items():
+            for (nid, label), mask in flags.items():
                 d = prof.setdefault(nodes[nid], {})
-                d[fl] = d.get(fl, 0) | mask
+                d[label] = d.get(label, 0) | mask
     except FileNotFoundError:
-        return None
-    print(f"value profile: {len(instrumented)} comparisons, {len(prof)} with flags, {bad} tests failed", file=sys.stderr)
-    if bad:
-        return None  # instrumentation changed behaviour somewhere: do not trust it
-    return {"nodes": frozenset(instrumented), "flags": prof}
+        with open(out_path, "wb") as f:
+            pickle.dump(None, f)
+        return
+    print(f"value profile run: {len(instrumented)} comparisons, {bin(bad).count('1')} tests failed", file=sys.stderr)
+    res = {"nodes": frozenset(instrumented), "flags": prof, "bad": bad}
+    with open(out_path, "wb") as f:
+        pickle.dump(res, f)
 
 
 def timing_pass():
@@ -714,6 +779,7 @@ def main():
         # Second pass in reverse order: lines whose test set changes depend on
         # run-once state (caches, lazy loading) and are flagged.
         rev_tests, rev_imports = collect(True)
+        order_dep_ran[0] = True
 
         def line_sets(pt):
             out = {}
@@ -746,6 +812,8 @@ def main():
                     cases[k] = (ls, cs)
             per_test[num] = (fwd[0] | v[0], fwd[1] | v[1], fwd[2] | v[2], cases, fwd[4], fwd[5])
 
+    # value profile only when the order-dependence pass ran (same robustness bar)
+    VPROF[0] = value_profile_pass() if (order_dep_ran[0] and time.monotonic() - T0 < BUDGET * 0.55) else None
     imp = {}
     for (r, l), v in import_lines.items():
         imp.setdefault(r, {})[l] = frozenset(v)
@@ -804,8 +872,8 @@ def main():
             "importers_top": static_importers(ROOT, top_only=True),
             "order_dep": {f: frozenset(v) for f, v in order_dep.items()},
             # seconds per test in the real runner (no tracing): relative CPU cost
-            "cost": timing_pass() if time.monotonic() - T0 < BUDGET * 0.6 else {},
-            "vprof": value_profile_pass() if time.monotonic() - T0 < BUDGET * 0.75 else None,
+            "vprof": VPROF[0],
+            "cost": timing_pass() if time.monotonic() - T0 < BUDGET * 0.75 else {},
             "ids": [t["id"] for t in TESTS]}
     with open(OUT, "wb") as f:
         pickle.dump(data, f, protocol=5)
@@ -818,4 +886,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 6 and sys.argv[5] == "--vprof-run":
+        value_profile_run(sys.argv[6])
+    else:
+        main()

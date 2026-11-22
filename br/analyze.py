@@ -324,14 +324,27 @@ class Analyzer:
             sites.append(self._classify(rel, linemap, node, chain, extra))
         return sites
 
-    _SWAP_FLAG = {
-        frozenset({"Is", "Eq"}): "D", frozenset({"IsNot", "NotEq"}): "D",
-        frozenset({"Lt", "LtE"}): "E", frozenset({"Gt", "GtE"}): "E",
-    }
+    @staticmethod
+    def _eval_cmp(op, label):
+        """Value of comparison `op` given an observed (identity, equality, order)
+        label from the pristine run; None when the observation cannot decide it."""
+        i, e, o = label[0] == "1", label[1], label[2]
+        if op == "Is":
+            return i
+        if op == "IsNot":
+            return not i
+        if op in ("Eq", "NotEq"):
+            if e == "u":
+                return None
+            return (e == "1") if op == "Eq" else (e != "1")
+        if o == "u":
+            return None
+        return {"Lt": o == "l", "LtE": o in "le", "Gt": o == "g", "GtE": o in "ge"}.get(op)
 
     def _infection_mask(self, rel, node, chain, extra):
-        """Single comparison-operator swap: only tests whose pristine run met the
-        infection condition at this exact comparison can behave differently."""
+        """A comparison whose operator changed can only alter tests whose pristine
+        evaluations of it would come out differently under the new operator
+        (execution is identical up to the first divergent evaluation)."""
         if self.vprof is None or not isinstance(node, ast.cmpop):
             return None
         if not (extra and extra[0] == "replace" and chain and isinstance(chain[-1], ast.Compare)):
@@ -339,11 +352,16 @@ class Analyzer:
         cmp = chain[-1]
         if len(cmp.ops) != 1:
             return None
-        flag = self._SWAP_FLAG.get(frozenset({type(node).__name__, type(extra[1]).__name__}))
         key = (rel, cmp.lineno, cmp.col_offset)
-        if flag is None or key not in self.vprof["nodes"]:
+        if key not in self.vprof["nodes"]:
             return None
-        return self.vprof["flags"].get(key, {}).get(flag, 0)
+        old, new = type(node).__name__, type(extra[1]).__name__
+        m = 0
+        for label, mask in self.vprof["obs"].get(key, {}).items():
+            a, b = self._eval_cmp(old, label), self._eval_cmp(new, label)
+            if a is None or b is None or a != b:
+                m |= mask
+        return m
 
     def _is_docstring(self, node, chain):
         if not (isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.strip()):
