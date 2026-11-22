@@ -177,8 +177,15 @@ class Analyzer:
         self.import_lines = maps.get("import_lines", {})
         self.importers = maps.get("importers", {})
         self.importers_top = maps.get("importers_top", {})
+        self.order_dep = maps.get("order_dep", {})
+        self._cost = maps.get("cost", {})
+        # scale traced timings to recorded-seconds units so the prior stays meaningful
+        tot_c = sum(self._cost.values()) or 1.0
+        tot_r = sum(t["seconds"] for t in tests) or 1.0
+        self.cost_scale = tot_r / tot_c
         self.n = len(tests)
         self.all_mask = (1 << self.n) - 1
+
         # map-index -> runtime test number (identity when tests.json matches the map)
         ids = maps.get("ids")
         run_ids = [t["id"] for t in tests]
@@ -198,9 +205,15 @@ class Analyzer:
         for key, m in self.classes.items():
             mod, _, q = key.partition(":")
             self.mod_classes.setdefault(mod, []).append((q, m))
+        # in the map's index space (masks are converted to runtime numbers at the end)
         self.file_tests = {}
-        for t in tests:
-            self.file_tests[t["file"]] = self.file_tests.get(t["file"], 0) | (1 << t["number"])
+        if self.remap is None:
+            for t in tests:
+                self.file_tests[t["file"]] = self.file_tests.get(t["file"], 0) | (1 << t["number"])
+        else:
+            for i, tid in enumerate(ids):
+                f = tid.split("::")[0]
+                self.file_tests[f] = self.file_tests.get(f, 0) | (1 << i)
 
     # -- usage masks -------------------------------------------------------
     def class_usage(self, rel, qual, cls_node):
@@ -374,6 +387,13 @@ class Analyzer:
                 # lambda body expression
                 lines.update(_full_lines(node if isinstance(node, ast.AST) and hasattr(node, "lineno") else f))
             m = _mask_lines(linemap, lines)
+            od = self.order_dep.get(rel)
+            if od and any(l in od for l in lines):
+                # run-once state (cache / lazy load): coverage only credits whichever
+                # test ran first, so widen to everything using this module
+                site = Site(rel, "runtime", m | self.module_usage(rel), f"{getattr(f, 'name', 'lambda')} +order-dependent")
+                site.probes = frozenset({rel} | self.import_time_modules(rel, lines))
+                return site
             imp = self.import_time_usage(rel, lines)
             if imp:
                 desc_extra = " +import-time"
@@ -430,6 +450,18 @@ class Analyzer:
                 break
         site.probes = frozenset(probes)
         return site
+
+    def cost(self, t, recorded):
+        """Relative CPU cost of runtime test t (falls back to recorded seconds)."""
+        if self._cost:
+            i = t if self.remap is None else getattr(self, "_inv", None) and self._inv.get(t)
+            if self.remap is not None and not hasattr(self, "_inv"):
+                self._inv = {r: j for j, r in enumerate(self.remap) if r is not None}
+                i = self._inv.get(t)
+            c = self._cost.get(i)
+            if c is not None:
+                return c * self.cost_scale
+        return recorded
 
     def cases_for(self, t):
         """Per-case map for runtime test number t (None if not case-split)."""

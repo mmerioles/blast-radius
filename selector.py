@@ -184,7 +184,7 @@ CAL = {"meas": 2.0 * float(os.environ.get("BR_CPU_PRIOR", "1.5")), "rec": 2.0}
 
 
 def cpu_factor():
-    return CAL["meas"] / CAL["rec"]
+    return min(5.0, max(0.2, CAL["meas"] / CAL["rec"]))
 
 
 def est_frac(an, spec, t):
@@ -199,11 +199,39 @@ def est_frac(an, spec, t):
     return min(1.0, 0.15 + 0.85 * k / max(1, n))
 
 
+def probe_expand(tests, plan, root, deadline, an, probe_fail, done):
+    """A module no longer imports: everything importing it (transitively) breaks."""
+    sec = [t["seconds"] for t in tests]
+    out = set()
+    if not probe_fail or an is None:
+        return out
+    m = 0
+    for rel in probe_fail:
+        m |= an._convert(an.import_closure(rel))
+    more = [i for i in range(len(tests)) if m >> i & 1 and i not in done]
+    cheap_more = [i for i in more if sec[i] < GIANT_S]
+    out |= {i for i in more if sec[i] >= GIANT_S}
+    log(f"{plan.cid}: import broken in {sorted(probe_fail)} -> +{len(more)} tests")
+    if cheap_more:
+        res2 = runner.run(root, [(i, tests[i]["id"], 4.0 + 6.0 * sec[i]) for i in cheap_more], deadline=deadline)
+        out |= {i for i, ok in res2.items() if not ok}
+        out |= {i for i in cheap_more if i not in res2}
+    return out
+
+
+def probe_only(tests, plan, root, deadline, an, done):
+    if not plan.probes:
+        return set()
+    probe_fail = set()
+    runner.run(root, [], deadline=deadline, probes=sorted(plan.probes), on_probe=probe_fail.add)
+    return probe_expand(tests, plan, root, deadline, an, probe_fail, done)
+
+
 def verify(tests, plan, root, deadline, an=None):
     """Run cheap candidates; return the chosen test set."""
     sec = [t["seconds"] for t in tests]
     specs = {i: (case_spec(an, plan.sites, i) if an is not None else None) for i in plan.cheap}
-    est = {i: sec[i] * est_frac(an, specs[i], i) for i in plan.cheap}
+    est = {i: (an.cost(i, sec[i]) if an is not None else sec[i]) * est_frac(an, specs[i], i) for i in plan.cheap}
     # cheapest (estimated) first: failures surface early and cheaply
     strong = 0
     for st in plan.sites:
@@ -215,6 +243,10 @@ def verify(tests, plan, root, deadline, an=None):
     state = {"blind": None}
     has_giants = bool(plan.giants)
     n_cheap = len(order)
+    gfiles = {tests[g]["file"] for g in plan.giants}
+    giant_peers = {i for i in order if tests[i]["file"] in gfiles}
+    # run the giants' file-mates early so that evidence arrives sooner
+    order.sort(key=lambda i: 0 if i in giant_peers else 1)
 
     def blind_inc(rest):
         inc_g = plan.giants_to_include(failed) if failed else []
@@ -225,19 +257,32 @@ def verify(tests, plan, root, deadline, an=None):
 
     def on_result(idx, ok, secs):
         ran.add(idx)
-        CAL["meas"] += secs
-        CAL["rec"] += est[idx]
-        if not ok:
+        new_fail = False
+        if ok:
+            CAL["meas"] += secs  # failures (timeouts, import errors) would skew it
+            CAL["rec"] += est[idx]
+        else:
             failed.add(idx)
+            new_fail = True
+        if state["blind"] is not None:
+            return False
+        # re-evaluate on a new failure or periodically (best_split is not free)
+        state["n"] = state.get("n", 0) + 1
+        if not new_fail and state["n"] % 25:
+            return False
         rest = [i for i in order if i not in ran]
-        if not rest or state["blind"] is not None:
+        if not rest:
             return False
         if not failed and has_giants:
-            # giants are only dropped once plenty of cheap evidence came back clean
-            if len(ran) < max(20, n_cheap // 2):
+            # giants are only dropped once plenty of cheap evidence came back clean,
+            # including every cheap candidate from each reachable giant's own file
+            if len(ran) < max(20, n_cheap // 2) or not giant_peers <= ran:
                 return False
         verify_cost = sum(est[i] for i in rest) * cpu_factor()
-        if blind_inc(rest) < 0.8 * verify_cost:
+        bi = blind_inc(rest)
+        if bi < 0.8 * verify_cost:
+            log(f"{plan.cid}: blind {len(rest)} rest: blind {bi:.2f}s < verify {verify_cost:.2f}s "
+                f"(factor {cpu_factor():.2f}, ran {len(ran)}, failed {len(failed)})")
             state["blind"] = rest
             return True
         return False
@@ -245,7 +290,7 @@ def verify(tests, plan, root, deadline, an=None):
     # Nothing run yet: going blind right away is only safe without giants.
     if not has_giants and order:
         if blind_inc(order) < 0.8 * (sum(est[i] for i in order) * cpu_factor() + 0.15):
-            return set(order) | set(plan.giants_to_include(set()))
+            return set(order) | set(plan.giants_to_include(set())) | probe_only(tests, plan, root, deadline, an, set(order))
 
     ids = [(i, tests[i]["id"], 4.0 + 6.0 * sec[i], specs[i]) for i in order]
     probe_fail = set()
@@ -254,20 +299,7 @@ def verify(tests, plan, root, deadline, an=None):
     for i, ok in res.items():
         if not ok:
             failed.add(i)
-    extra_chosen = set()
-    if probe_fail and an is not None:
-        # a module no longer imports: everything importing it (transitively) breaks
-        m = 0
-        for rel in probe_fail:
-            m |= an.import_closure(rel)
-        more = [i for i in range(len(tests)) if m >> i & 1 and i not in res]
-        cheap_more = [i for i in more if sec[i] < GIANT_S]
-        extra_chosen |= {i for i in more if sec[i] >= GIANT_S}
-        log(f"{plan.cid}: import broken in {sorted(probe_fail)} -> +{len(more)} tests")
-        if cheap_more:
-            res2 = runner.run(root, [(i, tests[i]["id"], 4.0 + 6.0 * sec[i]) for i in cheap_more], deadline=deadline)
-            extra_chosen |= {i for i, ok in res2.items() if not ok}
-            extra_chosen |= {i for i in cheap_more if i not in res2}
+    extra_chosen = probe_expand(tests, plan, root, deadline, an, probe_fail, set(res))
     chosen = set(failed)
     if state["blind"] is not None:
         chosen |= set(i for i in state["blind"] if i not in res)
@@ -297,16 +329,16 @@ def process(cid, tests, an, deadline):
     t0 = time.monotonic()
     c0 = _child_cpu()
     plan, files = handle(cid, tests, an)
-    if not plan.cands:
-        log(f"{cid}: no candidates ({len(plan.sites)} sites)")
-        return []
-    if not plan.cheap:
+    if not plan.cheap and not plan.probes:
         chosen = plan.giants_to_include(set())
-        log(f"{cid}: giants only -> {len(chosen)}")
+        log(f"{cid}: {len(plan.cands)} candidates, none cheap -> {len(chosen)}")
         return answer(tests, chosen)
     root = overlay.build(BASE, os.path.join(WORK, cid), {k: v[1] for k, v in files.items()})
     try:
-        chosen = verify(tests, plan, root, deadline, an)
+        if not plan.cheap:
+            chosen = set(plan.giants_to_include(set())) | probe_only(tests, plan, root, deadline, an, set())
+        else:
+            chosen = verify(tests, plan, root, deadline, an)
     finally:
         shutil.rmtree(root, ignore_errors=True)
     log(f"{cid}: cands={len(plan.cands)} cheap={len(plan.cheap)} est={plan.est:.2f}s "

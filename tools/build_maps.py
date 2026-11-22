@@ -18,7 +18,8 @@ ROOT = os.path.abspath(sys.argv[1])
 TESTS = json.load(open(sys.argv[2]))["tests"]
 OUT = sys.argv[3]
 SHARDS = int(sys.argv[4]) if len(sys.argv) > 4 else 4
-MIN_CASE_S = 0.05  # keep per-case maps only for tests worth filtering
+MIN_CASE_S = 0.05
+REVERSE = [False]  # keep per-case maps only for tests worth filtering
 
 CO_OPTIMIZED = 0x0001
 
@@ -293,6 +294,8 @@ def shard_main(shard_tests, out_path):
 
     by_class = {}
     order = []
+    if REVERSE[0]:
+        shard_tests = list(reversed(shard_tests))
     for t in shard_tests:
         path, cls, meth = t["id"].split("::")
         mod = path[:-3].replace("/", ".")
@@ -425,6 +428,45 @@ def static_importers(root, top_only=False):
     return {k: frozenset(v) for k, v in rev.items()}
 
 
+def timing_pass():
+    """Run every test once through the selector's own runner, untraced."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from br import runner
+
+    shards = [[] for _ in range(SHARDS)]
+    loads = [0.0] * SHARDS
+    for t in sorted(TESTS, key=lambda t: -t["seconds"]):
+        j = loads.index(min(loads))
+        shards[j].append(t)
+        loads[j] += t["seconds"]
+    tmp = OUT + ".tshard"
+    pids = []
+    for i, sh in enumerate(shards):
+        sh.sort(key=lambda t: t["id"])
+        pid = os.fork()
+        if pid == 0:
+            try:
+                got = {}
+                ids = [(t["number"], t["id"], 120.0) for t in sh]
+                runner.run(ROOT, ids, on_result=lambda n, ok, secs: got.__setitem__(n, secs))
+                with open(f"{tmp}{i}", "wb") as f:
+                    pickle.dump(got, f)
+            finally:
+                os._exit(0)
+        pids.append(pid)
+    for pid in pids:
+        os.waitpid(pid, 0)
+    cost = {}
+    for i in range(SHARDS):
+        try:
+            with open(f"{tmp}{i}", "rb") as f:
+                cost.update(pickle.load(f))
+            os.remove(f"{tmp}{i}")
+        except FileNotFoundError:
+            pass
+    return cost
+
+
 def main():
     # shard by test class, balancing recorded seconds
     groups = {}
@@ -437,27 +479,63 @@ def main():
         j = loads.index(min(loads))
         shards[j].extend(ts)
         loads[j] += sum(t["seconds"] for t in ts)
-    pids = []
-    tmp = OUT + ".shard"
-    for i, sh in enumerate(shards):
-        pid = os.fork()
-        if pid == 0:
-            try:
-                shard_main(sh, f"{tmp}{i}")
-            finally:
-                os._exit(0)
-        pids.append(pid)
-    for pid in pids:
-        os.waitpid(pid, 0)
-    per_test = {}
-    import_lines = {}
-    for i in range(SHARDS):
-        with open(f"{tmp}{i}", "rb") as f:
-            pt, il = pickle.load(f)
-            per_test.update(pt)
-            for k, v in il.items():
-                import_lines.setdefault(k, set()).update(v)
-        os.remove(f"{tmp}{i}")
+    def collect(reverse):
+        REVERSE[0] = reverse
+        pids = []
+        tmp = OUT + (".rshard" if reverse else ".shard")
+        for i, sh in enumerate(shards):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    shard_main(sh, f"{tmp}{i}")
+                finally:
+                    os._exit(0)
+            pids.append(pid)
+        for pid in pids:
+            os.waitpid(pid, 0)
+        per_test = {}
+        import_lines = {}
+        for i in range(SHARDS):
+            with open(f"{tmp}{i}", "rb") as f:
+                pt, il = pickle.load(f)
+                per_test.update(pt)
+                for k, v in il.items():
+                    import_lines.setdefault(k, set()).update(v)
+            os.remove(f"{tmp}{i}")
+        return per_test, import_lines
+
+    per_test, import_lines = collect(False)
+    order_dep = {}
+    if os.environ.get("BR_BOTH", "1") == "1":
+        # Second pass in reverse order: lines whose test set changes depend on
+        # run-once state (caches, lazy loading) and are flagged.
+        rev_tests, rev_imports = collect(True)
+
+        def line_sets(pt):
+            out = {}
+            for num, v in pt.items():
+                ls = set(v[0])
+                for seg in v[3].values():
+                    ls |= seg[0]
+                for k in ls:
+                    out[k] = out.get(k, 0) | (1 << num)
+            return out
+
+        fa, fb = line_sets(per_test), line_sets(rev_tests)
+        for k, v in rev_imports.items():
+            import_lines.setdefault(k, set()).update(v)
+        for k in set(fa) | set(fb):
+            # import-time lines are handled by import tracking + probes
+            if fa.get(k, 0) != fb.get(k, 0) and k not in import_lines:
+                order_dep.setdefault(k[0], set()).add(k[1])
+        # union coverage: add reverse-pass lines to the common segment
+        for num, v in rev_tests.items():
+            if num in per_test:
+                fwd = per_test[num]
+                extra = set(v[0])
+                for seg in v[3].values():
+                    extra |= seg[0]
+                per_test[num] = (fwd[0] | frozenset(extra), fwd[1] | v[1], fwd[2] | v[2], fwd[3], fwd[4], fwd[5])
     imp = {}
     for (r, l), v in import_lines.items():
         imp.setdefault(r, {})[l] = frozenset(v)
@@ -514,12 +592,16 @@ def main():
     data = {"lines": lines, "classes": classes, "files": files, "n": len(TESTS), "cases": cases,
             "import_lines": imp, "importers": static_importers(ROOT),
             "importers_top": static_importers(ROOT, top_only=True),
+            "order_dep": {f: frozenset(v) for f, v in order_dep.items()},
+            # seconds per test in the real runner (no tracing): relative CPU cost
+            "cost": timing_pass(),
             "ids": [t["id"] for t in TESTS]}
     with open(OUT, "wb") as f:
         pickle.dump(data, f, protocol=5)
     os.chmod(OUT, 0o644)
     print(f"maps: {len(per_test)} tests, {sum(len(v) for v in lines.values())} lines, "
-          f"{len(classes)} classes, {len(files)} files, {len(intern)} unique sets, {len(cases)} case-split tests; "
+          f"{len(classes)} classes, {len(files)} files, {len(intern)} unique sets, {len(cases)} case-split tests, "
+          f"{sum(len(v) for v in order_dep.values())} order-dependent lines; "
           f"failed under tracing: {len(bad)} {bad[:5]}; missing {len(missing)} {missing[:5]}", file=sys.stderr)
 
 

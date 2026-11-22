@@ -68,3 +68,20 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 - `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
 - The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
 - A change that only adds a comment is not promised to be harmless.
+
+## This submission
+
+`selector.py` + `br/` implement a coverage-guided, execution-verified selector:
+
+1. **Build time** (`tools/build_maps.py`, run in the Dockerfile on the pinned commit): per-test line coverage
+   (`sys.monitoring`), per-fixture-case coverage, classes instantiated, files read, import-time lines,
+   static import graph, order-dependent (run-once/cached) lines, and an untraced per-test timing pass.
+2. **Run time**: each patch is AST-diffed into change sites; each site maps to the tests that can reach it.
+   Cheap candidates are run against the patched tree (forked `unittest` child, filtered to the fixture cases
+   that reach the change; import probes catch modules that no longer import). Only tests that actually fail
+   are emitted; the rest of a commit's candidates are added blind when that is cheaper than verifying them.
+   Very slow tests are never executed and are included only on evidence.
+
+`tools/gate.py`, `tools/mutants.py`, `tools/truth.py`, `tools/evalrun.sh` are offline validation only
+(harness fidelity vs. `sample/answers.json`, and recall on synthetic mutants). Nothing from them is shipped
+in the image or used at run time.
