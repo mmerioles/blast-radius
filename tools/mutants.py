@@ -14,6 +14,7 @@ import sys
 
 ROOT, OUT, COUNT = sys.argv[1], sys.argv[2], int(sys.argv[3])
 SEED = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+MODE = sys.argv[5] if len(sys.argv) > 5 else "mixed"  # mixed | cmp | fix2
 rng = random.Random(SEED)
 
 SWAPS = [
@@ -108,6 +109,38 @@ def mutate_sql(text):
     return None
 
 
+CMP_SWAPS = [(r" is not ", " != "), (r" != ", " is not "), (r" is ", " == "), (r" == ", " is "),
+             (r" < ", " <= "), (r" <= ", " < "), (r" > ", " >= "), (r" >= ", " > ")]
+
+
+def mutate_cmp(text):
+    lines = text.split("\n")
+    cands = [i for i, l in enumerate(lines) if not l.strip().startswith("#") and any(re.search(p, l) for p, _ in CMP_SWAPS)]
+    for _ in range(100):
+        if not cands:
+            return None
+        i = rng.choice(cands)
+        line = lines[i]
+        p, q = rng.choice([(p, q) for p, q in CMP_SWAPS if re.search(p, line)])
+        m = rng.choice(list(re.finditer(p, line)))
+        new = "\n".join(lines[:i] + [line[: m.start()] + q + line[m.end():]] + lines[i + 1:])
+        try:
+            ast.parse(new)
+        except SyntaxError:
+            continue
+        return new
+    return None
+
+
+def fix2_files():
+    out = [f"tests/fixtures/{n}" for n in ("identity.sql", "pretty.sql", "partial.sql")]
+    for d, _, fs in os.walk(os.path.join(ROOT, "tests")):
+        for f in fs:
+            if f.endswith(".py") and f.startswith("test_"):
+                out.append(os.path.relpath(os.path.join(d, f), ROOT))
+    return sorted(out)
+
+
 def main():
     os.makedirs(os.path.join(OUT, "commits"), exist_ok=True)
     pys = py_files()
@@ -115,7 +148,16 @@ def main():
     fx = fixture_files()
     n = 0
     while n < COUNT:
-        if rng.random() < 0.25:
+        if MODE == "cmp":
+            rel = rng.choice(pys)
+            old = open(os.path.join(ROOT, rel)).read()
+            new = mutate_cmp(old)
+        elif MODE == "fix2":
+            f2 = fix2_files()
+            rel = f2[rng.randrange(3)] if rng.random() < 0.5 else rng.choice(f2[3:])
+            old = open(os.path.join(ROOT, rel)).read()
+            new = mutate_sql(old) if rel.endswith(".sql") else mutate_py(old)
+        elif rng.random() < 0.25:
             rel = rng.choice(fx)
             old = open(os.path.join(ROOT, rel)).read()
             new = mutate_sql(old)
@@ -131,7 +173,7 @@ def main():
         body = "".join(diff)
         if not body:
             continue
-        cid = f"m{SEED}x{n:03d}"
+        cid = f"{MODE[0]}{SEED}x{n:03d}"
         with open(os.path.join(OUT, "commits", cid + ".patch"), "w") as f:
             f.write(f"diff --git a/{rel} b/{rel}\n" + body)
         n += 1
