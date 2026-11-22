@@ -431,6 +431,205 @@ def static_importers(root, top_only=False):
     return {k: frozenset(v) for k, v in rev.items()}
 
 
+CMP_OPS = {"Is": 0, "IsNot": 1, "Eq": 2, "NotEq": 3, "Lt": 4, "LtE": 5, "Gt": 6, "GtE": 7}
+
+
+def _profile_shard(shard_tests, out_path):
+    """Value profile of single-operator comparisons (state-infection conditions).
+
+    Every `a OP b` in sqlglot/ is rewritten to __brc__(nid, OP, a, b), which returns
+    exactly the original result and records, per test:
+      'D': `a is b` and `a == b` disagreed (or could not be compared safely)
+      'E': a == b held (or unknown) -- the only case where < and <= (> and >=) differ
+    Before a mutant's first divergent evaluation, execution equals the pristine run, so
+    a test without the flag cannot be infected by the corresponding operator swap.
+    """
+    import ast
+    import builtins
+    import importlib._bootstrap_external as ibe
+    import types
+    import unittest
+
+    os.chdir(ROOT)
+    sys.path.insert(0, ROOT)
+    os.environ["PYTHONPATH"] = ROOT
+    os.environ["SKIP_INTEGRATION"] = "0"
+    sys.dont_write_bytecode = True
+    sys.modules["__main__"] = types.ModuleType("__main__")
+    sys.argv = ["python"]
+    prefix = os.path.join(ROOT, "sqlglot") + os.sep
+    nodes = []  # nid -> (rel, line, col)
+    cur = set()
+    SAFE = (type(None), bool, int, float, str, bytes)
+    import enum
+
+    # __eq__ implementations with no side effects (identity or primitive value)
+    PURE_EQ = {object.__eq__, str.__eq__, int.__eq__, float.__eq__, bytes.__eq__, bool.__eq__}
+    if "__eq__" in vars(enum.Enum):
+        PURE_EQ.add(enum.Enum.__eq__)
+
+    def safe(x):
+        t = type(x)
+        return t in SAFE or t.__eq__ in PURE_EQ
+
+    def brc(nid, op, a, b):
+        if op == 0 or op == 1:
+            r = a is b
+            if safe(a) and safe(b):
+                try:
+                    e = a == b
+                    if e is not r:
+                        cur.add((nid, "D"))
+                except Exception:
+                    cur.add((nid, "D"))
+            else:
+                cur.add((nid, "D"))
+            return r if op == 0 else not r
+        if op == 2 or op == 3:
+            r = (a == b) if op == 2 else (a != b)
+            i = a is b
+            if not isinstance(r, bool) or (r if op == 2 else not r) is not i:
+                cur.add((nid, "D"))
+            return r
+        r = (a < b) if op == 4 else (a <= b) if op == 5 else (a > b) if op == 6 else (a >= b)
+        if safe(a) and safe(b):
+            try:
+                if a == b:
+                    cur.add((nid, "E"))
+            except Exception:
+                cur.add((nid, "E"))
+        else:
+            cur.add((nid, "E"))
+        return r
+
+    builtins.__brc__ = brc
+
+    class T(ast.NodeTransformer):
+        def __init__(self, rel):
+            self.rel = rel
+
+        def visit_Compare(self, node):
+            self.generic_visit(node)
+            if len(node.ops) != 1:
+                return node
+            op = CMP_OPS.get(type(node.ops[0]).__name__)
+            if op is None:
+                return node
+            nid = len(nodes)
+            nodes.append((self.rel, node.lineno, node.col_offset))
+            call = ast.Call(
+                func=ast.Name("__brc__", ast.Load()),
+                args=[ast.Constant(nid), ast.Constant(op), node.left, node.comparators[0]],
+                keywords=[],
+            )
+            return ast.copy_location(call, node)
+
+    orig_get_code = ibe.SourceFileLoader.get_code
+
+    def get_code(self, fullname):
+        path = self.get_filename(fullname)
+        if not path.startswith(prefix):
+            return orig_get_code(self, fullname)
+        rel = os.path.relpath(path, ROOT)
+        with open(path, "rb") as f:
+            src = f.read()
+        tree = ast.parse(src, path)
+        tree = ast.fix_missing_locations(T(rel).visit(tree))
+        return compile(tree, path, "exec", dont_inherit=True)
+
+    ibe.SourceFileLoader.get_code = get_code
+
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from br.runner import _sync_executor
+
+    sync = _sync_executor()
+    by_class, order = {}, []
+    for t in shard_tests:
+        path, cls, meth = t["id"].split("::")
+        key = (path[:-3].replace("/", "."), cls)
+        if key not in by_class:
+            by_class[key] = []
+            order.append(key)
+        by_class[key].append((t["number"], meth))
+    flags = {}
+    bad = 0
+    for mod, cls in order:
+        try:
+            __import__(mod)
+            m = sys.modules[mod]
+            if hasattr(m, "ProcessPoolExecutor"):
+                m.ProcessPoolExecutor = sync
+            klass = getattr(m, cls)
+            cur.clear()
+            klass.setUpClass()
+        except BaseException:
+            continue
+        cls_flags = set(cur)
+        for num, meth in by_class[(mod, cls)]:
+            cur.clear()
+            cur.update(cls_flags)
+            res = unittest.TestResult()
+            try:
+                klass(meth).run(res)
+            except BaseException:
+                pass
+            if res.errors or res.failures:
+                bad += 1
+            bit = 1 << num
+            for k in cur:
+                flags[k] = flags.get(k, 0) | bit
+        try:
+            klass.tearDownClass()
+            klass.doClassCleanups()
+        except BaseException:
+            pass
+    with open(out_path, "wb") as f:
+        pickle.dump((nodes, flags, bad), f)
+
+
+def value_profile_pass():
+    shards = [[] for _ in range(SHARDS)]
+    loads = [0.0] * SHARDS
+    groups = {}
+    for t in TESTS:
+        groups.setdefault(t["id"].rsplit("::", 1)[0], []).append(t)
+    for key, ts in sorted(groups.items(), key=lambda kv: -sum(t["seconds"] for t in kv[1])):
+        j = loads.index(min(loads))
+        shards[j].extend(ts)
+        loads[j] += sum(t["seconds"] for t in ts)
+    tmp = OUT + ".vshard"
+    pids = []
+    for i, sh in enumerate(shards):
+        pid = os.fork()
+        if pid == 0:
+            try:
+                _profile_shard(sh, f"{tmp}{i}")
+            finally:
+                os._exit(0)
+        pids.append(pid)
+    for pid in pids:
+        os.waitpid(pid, 0)
+    prof = {}
+    instrumented = set()
+    bad = 0
+    try:
+        for i in range(SHARDS):
+            with open(f"{tmp}{i}", "rb") as f:
+                nodes, flags, b = pickle.load(f)
+            os.remove(f"{tmp}{i}")
+            bad += b
+            instrumented.update(nodes)
+            for (nid, fl), mask in flags.items():
+                d = prof.setdefault(nodes[nid], {})
+                d[fl] = d.get(fl, 0) | mask
+    except FileNotFoundError:
+        return None
+    print(f"value profile: {len(instrumented)} comparisons, {len(prof)} with flags, {bad} tests failed", file=sys.stderr)
+    if bad:
+        return None  # instrumentation changed behaviour somewhere: do not trust it
+    return {"nodes": frozenset(instrumented), "flags": prof}
+
+
 def timing_pass():
     """Run every test once through the selector's own runner, untraced."""
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -605,7 +804,8 @@ def main():
             "importers_top": static_importers(ROOT, top_only=True),
             "order_dep": {f: frozenset(v) for f, v in order_dep.items()},
             # seconds per test in the real runner (no tracing): relative CPU cost
-            "cost": timing_pass() if time.monotonic() - T0 < BUDGET * 0.7 else {},
+            "cost": timing_pass() if time.monotonic() - T0 < BUDGET * 0.6 else {},
+            "vprof": value_profile_pass() if time.monotonic() - T0 < BUDGET * 0.75 else None,
             "ids": [t["id"] for t in TESTS]}
     with open(OUT, "wb") as f:
         pickle.dump(data, f, protocol=5)

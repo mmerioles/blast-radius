@@ -57,7 +57,7 @@ def _same(x, y):
 def ast_diff(a, b, parents, out):
     """Collect (old_node, parent_chain, field) for minimal differences."""
     if type(a) is not type(b):
-        out.append((a, parents, None))
+        out.append((a, parents, ("replace", b)))
         return
     if not isinstance(a, ast.AST):
         if a != b:
@@ -179,6 +179,7 @@ class Analyzer:
         self.importers_top = maps.get("importers_top", {})
         self.order_dep = maps.get("order_dep", {})
         self._cost = maps.get("cost", {})
+        self.vprof = maps.get("vprof") or None
         # scale traced timings to recorded-seconds units so the prior stays meaningful
         tot_c = sum(self._cost.values()) or 1.0
         tot_r = sum(t["seconds"] for t in tests) or 1.0
@@ -323,6 +324,27 @@ class Analyzer:
             sites.append(self._classify(rel, linemap, node, chain, extra))
         return sites
 
+    _SWAP_FLAG = {
+        frozenset({"Is", "Eq"}): "D", frozenset({"IsNot", "NotEq"}): "D",
+        frozenset({"Lt", "LtE"}): "E", frozenset({"Gt", "GtE"}): "E",
+    }
+
+    def _infection_mask(self, rel, node, chain, extra):
+        """Single comparison-operator swap: only tests whose pristine run met the
+        infection condition at this exact comparison can behave differently."""
+        if self.vprof is None or not isinstance(node, ast.cmpop):
+            return None
+        if not (extra and extra[0] == "replace" and chain and isinstance(chain[-1], ast.Compare)):
+            return None
+        cmp = chain[-1]
+        if len(cmp.ops) != 1:
+            return None
+        flag = self._SWAP_FLAG.get(frozenset({type(node).__name__, type(extra[1]).__name__}))
+        key = (rel, cmp.lineno, cmp.col_offset)
+        if flag is None or key not in self.vprof["nodes"]:
+            return None
+        return self.vprof["flags"].get(key, {}).get(flag, 0)
+
     def _is_docstring(self, node, chain):
         if not (isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.strip()):
             return False
@@ -395,6 +417,12 @@ class Analyzer:
                 site.probes = frozenset({rel} | self.import_time_modules(rel, lines))
                 return site
             imp = self.import_time_usage(rel, lines)
+            if not imp:
+                red = self._infection_mask(rel, node, chain, extra)
+                if red is not None:
+                    site = Site(rel, "runtime", m & red, f"{getattr(f, 'name', 'lambda')} cmp-swap",
+                                detail=("lines", rel, frozenset(lines)))
+                    return site
             if imp:
                 desc_extra = " +import-time"
                 m |= imp
