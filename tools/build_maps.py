@@ -19,6 +19,9 @@ TESTS = json.load(open(sys.argv[2]))["tests"]
 OUT = sys.argv[3]
 SHARDS = int(sys.argv[4]) if len(sys.argv) > 4 else 4
 MIN_CASE_S = 0.05
+T0 = time.monotonic()
+# The image build has 10 minutes in total; optional passes are skipped when slow.
+BUDGET = float(os.environ.get("BR_MAP_BUDGET", "330"))
 REVERSE = [False]  # keep per-case maps only for tests worth filtering
 
 CO_OPTIMIZED = 0x0001
@@ -506,7 +509,9 @@ def main():
 
     per_test, import_lines = collect(False)
     order_dep = {}
-    if os.environ.get("BR_BOTH", "1") == "1":
+    fwd_s = time.monotonic() - T0
+    print(f"forward pass {fwd_s:.0f}s", file=sys.stderr)
+    if os.environ.get("BR_BOTH", "1") == "1" and fwd_s * 2.2 < BUDGET:
         # Second pass in reverse order: lines whose test set changes depend on
         # run-once state (caches, lazy loading) and are flagged.
         rev_tests, rev_imports = collect(True)
@@ -594,14 +599,15 @@ def main():
             "importers_top": static_importers(ROOT, top_only=True),
             "order_dep": {f: frozenset(v) for f, v in order_dep.items()},
             # seconds per test in the real runner (no tracing): relative CPU cost
-            "cost": timing_pass(),
+            "cost": timing_pass() if time.monotonic() - T0 < BUDGET * 0.7 else {},
             "ids": [t["id"] for t in TESTS]}
     with open(OUT, "wb") as f:
         pickle.dump(data, f, protocol=5)
     os.chmod(OUT, 0o644)
     print(f"maps: {len(per_test)} tests, {sum(len(v) for v in lines.values())} lines, "
           f"{len(classes)} classes, {len(files)} files, {len(intern)} unique sets, {len(cases)} case-split tests, "
-          f"{sum(len(v) for v in order_dep.values())} order-dependent lines; "
+          f"{sum(len(v) for v in order_dep.values())} order-dependent lines, {len(data['cost'])} timings, "
+          f"{time.monotonic() - T0:.0f}s; "
           f"failed under tracing: {len(bad)} {bad[:5]}; missing {len(missing)} {missing[:5]}", file=sys.stderr)
 
 
