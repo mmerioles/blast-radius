@@ -310,7 +310,22 @@ class Analyzer:
             sites.append(self._classify(rel, linemap, node, chain, extra))
         return sites
 
+    def _is_docstring(self, node, chain):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.strip()):
+            return False
+        if len(chain) < 2 or not isinstance(chain[-1], ast.Expr):
+            return False
+        owner = chain[-2]
+        body = getattr(owner, "body", None)
+        return (
+            isinstance(owner, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+            and isinstance(body, list) and body and body[0] is chain[-1]
+        )
+
     def _classify(self, rel, linemap, node, chain, extra):
+        if self._is_docstring(node, chain):
+            # docstrings are only observable via __doc__ / source readers
+            return Site(rel, "noop", self.files.get(rel, 0), "docstring")
         # Find innermost function/lambda ancestor such that the change is in its body.
         is_insert = node == "insert"
         full = chain + ([node] if isinstance(node, ast.AST) else [])

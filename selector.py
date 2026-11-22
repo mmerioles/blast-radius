@@ -179,41 +179,75 @@ def blind_answer(tests, plan):
     return answer(tests, plan.cands)
 
 
+# Self-calibrating CPU model: our CPU-seconds per recorded second (per worker).
+CAL = {"meas": 2.0 * float(os.environ.get("BR_CPU_PRIOR", "1.5")), "rec": 2.0}
+
+
+def cpu_factor():
+    return CAL["meas"] / CAL["rec"]
+
+
+def est_frac(an, spec, t):
+    """Fraction of a test's recorded time we expect to spend with a case filter."""
+    if spec is None:
+        return 1.0
+    cases = an.cases_for(t)
+    if not cases:
+        return 1.0
+    n = len(cases["keys"])
+    k = sum(len(v) for v in spec.values())
+    return min(1.0, 0.15 + 0.85 * k / max(1, n))
+
+
 def verify(tests, plan, root, deadline, an=None):
     """Run cheap candidates; return the chosen test set."""
     sec = [t["seconds"] for t in tests]
-    # strong-first, then cheapest first; keep classes together via runner grouping
+    specs = {i: (case_spec(an, plan.sites, i) if an is not None else None) for i in plan.cheap}
+    est = {i: sec[i] * est_frac(an, specs[i], i) for i in plan.cheap}
+    # cheapest (estimated) first: failures surface early and cheaply
     strong = 0
-    for s in plan.sites:
-        strong |= s.strong
-    order = sorted(plan.cheap, key=lambda i: (0 if strong >> i & 1 else 1, sec[i]))
+    for st in plan.sites:
+        strong |= st.strong
+    w = float(os.environ.get("BR_WEAK_W", "4"))
+    order = sorted(plan.cheap, key=lambda i: (est[i] * (1.0 if strong >> i & 1 else w), sec[i]))
     failed = set()
     ran = set()
     state = {"blind": None}
+    has_giants = bool(plan.giants)
+    n_cheap = len(order)
+
+    def blind_inc(rest):
+        inc_g = plan.giants_to_include(failed) if failed else []
+        base_set = failed | set(inc_g)
+        base = best_split([(ms(tests, i), i) for i in base_set])[0] if base_set else 0
+        full = best_split([(ms(tests, i), i) for i in base_set | set(rest)])[0]
+        return (full - base) / 1000
 
     def on_result(idx, ok, secs):
         ran.add(idx)
+        CAL["meas"] += secs
+        CAL["rec"] += est[idx]
         if not ok:
             failed.add(idx)
-            if state["blind"] is None and len(failed) == 1:
-                # decide: verify the rest, or add them blind?
-                rest = [i for i in order if i not in ran]
-                if not rest:
-                    return False
-                inc_g = plan.giants_to_include(failed)
-                base = best_split([(ms(tests, i), i) for i in failed | set(inc_g)])[0]
-                with_rest = best_split([(ms(tests, i), i) for i in failed | set(inc_g) | set(rest)])[0]
-                blind_cost = (with_rest - base) / 1000
-                verify_cost = sum(sec[i] for i in rest) * CPU_FACTOR
-                if blind_cost <= verify_cost:
-                    state["blind"] = rest
-                    return True
+        rest = [i for i in order if i not in ran]
+        if not rest or state["blind"] is not None:
+            return False
+        if not failed and has_giants:
+            # giants are only dropped once plenty of cheap evidence came back clean
+            if len(ran) < max(20, n_cheap // 2):
+                return False
+        verify_cost = sum(est[i] for i in rest) * cpu_factor()
+        if blind_inc(rest) < 0.8 * verify_cost:
+            state["blind"] = rest
+            return True
         return False
 
-    ids = []
-    for i in order:
-        spec = case_spec(an, plan.sites, i) if an is not None else None
-        ids.append((i, tests[i]["id"], 4.0 + 6.0 * sec[i], spec))
+    # Nothing run yet: going blind right away is only safe without giants.
+    if not has_giants and order:
+        if blind_inc(order) < 0.8 * (sum(est[i] for i in order) * cpu_factor() + 0.15):
+            return set(order) | set(plan.giants_to_include(set()))
+
+    ids = [(i, tests[i]["id"], 4.0 + 6.0 * sec[i], specs[i]) for i in order]
     probe_fail = set()
     res = runner.run(root, ids, deadline=deadline, on_result=on_result,
                      probes=sorted(plan.probes), on_probe=probe_fail.add)
@@ -325,7 +359,8 @@ def main():
             fallback[cid] = answer(tests, range(len(tests)))
     preload()
 
-    jobs = sorted(cids, key=lambda c: -(plans[c].est if c in plans else 0))
+    # cheap commits first: they calibrate the CPU model before the expensive decisions
+    jobs = sorted(cids, key=lambda c: (plans[c].est if c in plans else 0))
     import select
 
     workers = []

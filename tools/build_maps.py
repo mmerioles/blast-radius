@@ -154,6 +154,20 @@ def shard_main(shard_tests, out_path):
             f = f.f_back
         return False
 
+    def source_for_display():
+        """linecache reads made while formatting tracebacks/warnings are not
+        dependencies; inspect.getsource (also linecache) is."""
+        f = sys._getframe(2)
+        lc = False
+        while f is not None:
+            fn = f.f_code.co_filename
+            if fn.endswith("inspect.py"):
+                return False
+            if fn.endswith("linecache.py") or fn.endswith("traceback.py"):
+                lc = True
+            f = f.f_back
+        return lc
+
     tracing = [False]
 
     def audit(event, args):
@@ -175,6 +189,8 @@ def shard_main(shard_tests, out_path):
             if not ap.startswith(root_prefix):
                 return
             if event == "open" and in_import():
+                return
+            if event == "open" and ap.endswith(".py") and source_for_display():
                 return
             cur_files.add(ap[len(root_prefix):])
 

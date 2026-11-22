@@ -14,6 +14,9 @@ import sys
 import time
 
 
+PK = os.environ.get("BR_PICKLE", "1") == "1"
+
+
 class _Timeout(BaseException):
     pass
 
@@ -38,9 +41,9 @@ def _sync_executor():
         def submit(self, fn, *args, **kwargs):
             f = cf.Future()
             try:
-                fn2, args2, kwargs2 = pk.loads(pk.dumps((fn, args, kwargs)))
+                fn2, args2, kwargs2 = pk.loads(pk.dumps((fn, args, kwargs))) if PK else (fn, args, kwargs) if PK else (fn, args, kwargs)
                 r = fn2(*args2, **kwargs2)
-                f.set_result(pk.loads(pk.dumps(r)))
+                f.set_result(pk.loads(pk.dumps(r)) if PK else r)
             except BaseException as e:  # noqa
                 if isinstance(e, _Timeout):
                     raise
