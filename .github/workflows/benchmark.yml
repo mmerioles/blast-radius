@@ -3,39 +3,57 @@ name: Benchmark selector
 on:
   push:
   workflow_dispatch:
+    inputs:
+      base:
+        description: "Ref to A/B against (default: previous commit)"
+        required: false
 
 jobs:
   sample:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Build image (same as the scorer, linux/amd64)
+      - name: Build HEAD image (same as the scorer, linux/amd64)
         run: |
           start=$(date +%s)
-          make build
-          echo "build took $(( $(date +%s) - start ))s (limit 600s)"
+          docker build --platform linux/amd64 --tag br-head . 2>&1 | grep -E "maps:|forward pass|ERROR|error" || true
+          docker image inspect br-head > /dev/null
+          echo "HEAD build took $(( $(date +%s) - start ))s (limit 600s)"
 
-      - name: Run 3 times under the scorer's limits and score
+      - name: Build baseline image
         run: |
-          set -o pipefail
-          for i in 1 2 3; do
-            start=$(date +%s)
+          base="${{ github.event.inputs.base }}"
+          base="${base:-HEAD~1}"
+          git worktree add /tmp/base "$base"
+          echo "baseline: $(git -C /tmp/base log --oneline -1)"
+          docker build --platform linux/amd64 --tag br-base /tmp/base > /dev/null 2>&1 || echo "baseline build failed"
+
+      - name: Run A/B alternately under the scorer's limits
+        run: |
+          run() {
             docker run --rm --platform linux/amd64 --network none --cpus 2 \
               --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
               --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
               --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
               --volume $PWD/sample/commits:/data/commits:ro \
               --volume $PWD/sample/tests.json:/data/tests.json:ro \
-              blast-radius-entry > output.jsonl 2> stderr.txt
-            echo "run $i wall $(( $(date +%s) - start ))s (limit 180s)"
-            grep -E "fallback|error|Traceback|done in" stderr.txt || true
-            cpu=$(sed -n 's/^BR_CPU_SECONDS=//p' stderr.txt | tail -1)
-            echo "container cpu: ${cpu}s"
-            python3 score.py sample sample/answers.json output.jsonl --cpu-seconds "${cpu:-0}" | tee score_$i.txt
+              "$1" > out_$1.jsonl 2> err_$1.txt
+            cpu=$(sed -n 's/^BR_CGROUP_CPU_SECONDS=//p' err_$1.txt | tail -1)
+            [ -z "$cpu" ] && cpu=$(sed -n 's/^BR_CPU_SECONDS=//p' err_$1.txt | tail -1)
+            tot=$(python3 score.py sample sample/answers.json out_$1.jsonl --cpu-seconds "${cpu:-0}" | sed -n 's/^Total: *//p')
+            sim=$(python3 score.py sample sample/answers.json out_$1.jsonl | sed -n 's/^Simulated: *//p')
+            miss=$(python3 score.py sample sample/answers.json out_$1.jsonl | sed -n 's/^Misses: *\([0-9]*\).*/\1/p')
+            echo "RESULT $1 total=$tot sim=$sim cpu=$cpu misses=$miss"
+          }
+          for i in 1 2 3; do
+            run br-head
+            if docker image inspect br-base > /dev/null 2>&1; then run br-base; fi
           done
 
-      - name: Selector log (last run)
+      - name: HEAD per-commit log (last run)
         if: always()
-        run: cat stderr.txt | grep -v "Unable to set\|unsupported syntax\|Falling back" | tail -80
+        run: grep -E "cpu=|blind|broken|fallback|Traceback|done in|BR_" err_br-head.txt || true

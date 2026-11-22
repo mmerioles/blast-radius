@@ -38,6 +38,7 @@ GIANT_S = float(os.environ.get("BR_GIANT", "3.0"))  # never execute tests this s
 CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "1.0"))  # our cpu-seconds per recorded second
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
 START = time.monotonic()
+PLANS = {}  # cid -> (plan, files), computed once in the parent and inherited by workers
 
 
 def log(*a):
@@ -67,6 +68,7 @@ class Plan:
             mask |= s.mask
         self.cands = [i for i in range(an.n) if mask >> i & 1]
         sec = [t["seconds"] for t in tests]
+        self.file = [t["file"] for t in tests]
         self.cheap = [i for i in self.cands if sec[i] < GIANT_S]
         self.giants = [i for i in self.cands if sec[i] >= GIANT_S]
         # per giant: list of (site_index) reaching it
@@ -90,7 +92,9 @@ class Plan:
                 if not cheap:
                     inc = True  # nothing cheaper can tell us about this site
                 elif strong and (cheap & failed):
-                    inc = True
+                    inc = True  # the giant runs the changed line and the change bites
+                elif not strong and any(self.file[i] == self.file[g] for i in cheap & failed):
+                    inc = True  # class/module-level change: need a failing file-mate
                 if inc:
                     break
             if inc:
@@ -328,7 +332,8 @@ def _child_cpu():
 def process(cid, tests, an, deadline):
     t0 = time.monotonic()
     c0 = _child_cpu()
-    plan, files = handle(cid, tests, an)
+    cached = PLANS.get(cid)
+    plan, files = cached if cached else handle(cid, tests, an)
     if not plan.cheap and not plan.probes:
         chosen = plan.giants_to_include(set())
         log(f"{cid}: {len(plan.cands)} candidates, none cheap -> {len(chosen)}")
@@ -383,8 +388,9 @@ def main():
     plans = {}
     for cid in cids:
         try:
-            plan, _ = handle(cid, tests, an)
+            plan, files = handle(cid, tests, an)
             plans[cid] = plan
+            PLANS[cid] = (plan, files)
             fallback[cid] = blind_answer(tests, plan)
         except Exception:
             log(f"{cid}: plan error\n{traceback.format_exc()}")

@@ -533,14 +533,20 @@ def main():
             # import-time lines are handled by import tracking + probes
             if fa.get(k, 0) != fb.get(k, 0) and k not in import_lines:
                 order_dep.setdefault(k[0], set()).add(k[1])
-        # union coverage: add reverse-pass lines to the common segment
+        # union coverage segment by segment (common with common, case k with case k)
         for num, v in rev_tests.items():
-            if num in per_test:
-                fwd = per_test[num]
-                extra = set(v[0])
-                for seg in v[3].values():
-                    extra |= seg[0]
-                per_test[num] = (fwd[0] | frozenset(extra), fwd[1] | v[1], fwd[2] | v[2], fwd[3], fwd[4], fwd[5])
+            if num not in per_test:
+                per_test[num] = v
+                continue
+            fwd = per_test[num]
+            cases = dict(fwd[3])
+            for k, (ls, cs) in v[3].items():
+                if k in cases:
+                    cases[k] = (cases[k][0] | ls, cases[k][1] | cs)
+                else:
+                    cases[k] = (ls, cs)
+            per_test[num] = (fwd[0] | v[0], fwd[1] | v[1], fwd[2] | v[2], cases, fwd[4], fwd[5])
+
     imp = {}
     for (r, l), v in import_lines.items():
         imp.setdefault(r, {})[l] = frozenset(v)

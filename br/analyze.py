@@ -432,14 +432,11 @@ class Analyzer:
                 # never instantiated through a wrapped __init__ (enums, namespaces,
                 # test classes): fall back to everything that uses the module
                 m |= self.module_usage(rel)
-            strong |= _mask_lines(linemap, _full_lines(cls_chain[-1]))
             desc.append(f"class {qual}")
             kind = "class"
         else:
             if not desc:
                 m |= self.module_usage(rel)
-                for v in linemap.values():
-                    strong |= v
             kind = "module" if not desc else "function_def"
             desc.append("module")
         site = Site(rel, kind, m, " / ".join(desc), strong, detail)

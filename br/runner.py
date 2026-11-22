@@ -128,6 +128,11 @@ def _child(root: str, ids: list[tuple[int, str, float]], wfd: int, stop_on_fail:
         return loader
 
     failed_modules = set()
+    if os.environ.get("BR_GC", "1") == "1":
+        import gc
+
+        gc.freeze()  # imported modules never need scanning
+        gc.set_threshold(100000, 50, 50)
 
     # import probes: a module that cannot be imported breaks every importer
     for rel in probes:
@@ -147,6 +152,8 @@ def _child(root: str, ids: list[tuple[int, str, float]], wfd: int, stop_on_fail:
         def __init__(self):
             super().__init__()
             self.bad = False
+            # stop a test at its first failing subtest: the verdict is settled
+            self.failfast = True
 
         def addError(self, test, err):
             if isinstance(err[1], _Timeout):
