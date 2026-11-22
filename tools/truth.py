@@ -23,7 +23,7 @@ def one(cid):
         for site in an.analyze(pf):
             m |= site.mask
         skip = {t["number"] for t in tests if t["seconds"] >= 3.0 and not (m >> t["number"] & 1)}
-    ids = [(t["number"], t["id"], max(30.0, 10 * t["seconds"])) for t in tests if t["number"] not in skip]
+    ids = [(t["number"], t["id"], max(15.0, 5 * t["seconds"])) for t in tests if t["number"] not in skip]
     res = runner.run(root, ids)
     import shutil; shutil.rmtree(root, ignore_errors=True)
     return cid, sorted(i for i, ok in res.items() if not ok)

@@ -20,8 +20,8 @@ COPY br /app/br
 COPY tools/build_maps.py /app/tools/build_maps.py
 RUN mkdir -p /opt/brmaps \
  && cd /opt/sqlglot && SKIP_INTEGRATION=0 PYTHONPATH=/opt/sqlglot \
-    python /app/tools/build_maps.py /opt/sqlglot /app/tests.json /opt/brmaps/maps.pickle 4 \
-    2>&1 | grep -E "^maps|fail|Error" ; test -s /opt/brmaps/maps.pickle \
+    PYTHONHASHSEED=11 python /app/tools/build_maps.py /opt/sqlglot /app/tests.json /opt/brmaps/maps.pickle 4 \
+    2>&1 | grep -E "^maps|value profile|forward pass|Error" ; test -s /opt/brmaps/maps.pickle \
  && chmod -R a+rX /opt/sqlglot /opt/brmaps /app
 
 COPY selector.py /app/selector.py

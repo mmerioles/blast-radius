@@ -23,6 +23,7 @@ T0 = time.monotonic()
 # The image build has 10 minutes in total; optional passes are skipped when slow.
 BUDGET = float(os.environ.get("BR_MAP_BUDGET", "330"))
 REVERSE = [False]
+REVERSE_ONLY = [None]
 VPROF = [None]
 order_dep_ran = [False]  # keep per-case maps only for tests worth filtering
 
@@ -219,6 +220,8 @@ def shard_main(shard_tests, out_path):
             mon.restart_events()
 
     ibe.SourceFileLoader.exec_module = exec_module
+    OBS = [set()]
+    cmp_nodes = install_cmp_profiler(OBS)
     # start monitoring before any sqlglot import so import-time code is seen
     mon.use_tool_id(TOOL, "brmap")
     mon.register_callback(TOOL, mon.events.LINE, on_line)
@@ -331,18 +334,21 @@ def shard_main(shard_tests, out_path):
             continue
         # setUpClass coverage is attributed to every test of the class
         reset_segments(); cur_files.clear()
+        OBS[0] = set()
         tracing[0] = True
         try:
             klass.setUpClass()
         except BaseException as e:
             print("setUpClass fail", cls, e, file=sys.stderr)
         tracing[0] = False
+        cls_obs = OBS[0]
         cls_snap = snapshot()
         cls_snap = (cls_snap[0] | frozenset(l for v in cls_snap[3].values() for l in v[0]),
                     cls_snap[1] | frozenset(c for v in cls_snap[3].values() for c in v[1]),
                     cls_snap[2], {})
         for num, meth in by_class[(mod, cls)]:
             reset_segments(); cur_files.clear()
+            OBS[0] = set(cls_obs)
             res = unittest.TestResult()
             tracing[0] = True
             t0 = time.perf_counter()
@@ -355,7 +361,8 @@ def shard_main(shard_tests, out_path):
             wrap_all()  # newly lazy-loaded dialect modules
             s = snapshot()
             ok = not (res.errors or res.failures)
-            per_test[num] = (s[0] | cls_snap[0], s[1] | cls_snap[1], s[2] | cls_snap[2], s[3], ok, dt)
+            obs = frozenset((cmp_nodes[nid], lab) for nid, lab in OBS[0])
+            per_test[num] = (s[0] | cls_snap[0], s[1] | cls_snap[1], s[2] | cls_snap[2], s[3], ok, dt, obs)
         try:
             klass.tearDownClass()
             klass.doClassCleanups()
@@ -363,7 +370,7 @@ def shard_main(shard_tests, out_path):
             pass
     mon.set_events(TOOL, 0)
     with open(out_path, "wb") as f:
-        pickle.dump((per_test, import_lines), f)
+        pickle.dump((per_test, import_lines, frozenset(cmp_nodes)), f)
 
 
 def static_importers(root, top_only=False):
@@ -436,57 +443,36 @@ def static_importers(root, top_only=False):
 CMP_OPS = {"Is": 0, "IsNot": 1, "Eq": 2, "NotEq": 3, "Lt": 4, "LtE": 5, "Gt": 6, "GtE": 7}
 
 
-def _profile_shard(shard_tests, out_path):
-    """Value profile of single-operator comparisons (state-infection conditions).
-
-    Every `a OP b` in sqlglot/ is rewritten to __brc__(nid, OP, a, b), which returns
-    exactly the original result and records, per test:
-      'D': `a is b` and `a == b` disagreed (or could not be compared safely)
-      'E': a == b held (or unknown) -- the only case where < and <= (> and >=) differ
-    Before a mutant's first divergent evaluation, execution equals the pristine run, so
-    a test without the flag cannot be infected by the corresponding operator swap.
-    """
+def install_cmp_profiler(obs):
+    """Rewrite every single-op comparison in sqlglot/ to __brc__(nid, OP, a, b), which
+    returns exactly the original result and adds an edit-agnostic observation
+    (nid, "<is><eq><order>") of that evaluation to obs[0]. Returns the nid -> key list."""
     import ast
     import builtins
-    import importlib._bootstrap_external as ibe
-    import types
-    import unittest
-
-    os.chdir(ROOT)
-    sys.path.insert(0, ROOT)
-    os.environ["PYTHONPATH"] = ROOT
-    os.environ["SKIP_INTEGRATION"] = "0"
-    sys.dont_write_bytecode = True
-    sys.modules["__main__"] = types.ModuleType("__main__")
-    sys.argv = ["python"]
-    prefix = os.path.join(ROOT, "sqlglot") + os.sep
-    nodes = []  # nid -> (rel, line, col)
-    cur = set()
-    SAFE = (type(None), bool, int, float, str, bytes)
     import enum
+    import importlib._bootstrap_external as ibe
 
-    # __eq__ implementations with no side effects (identity or primitive value)
+    prefix = os.path.join(ROOT, "sqlglot") + os.sep
+    nodes = []
+    SAFE = (type(None), bool, int, float, str, bytes)
     PURE_EQ = {object.__eq__, str.__eq__, int.__eq__, float.__eq__, bytes.__eq__, bool.__eq__}
     if "__eq__" in vars(enum.Enum):
         PURE_EQ.add(enum.Enum.__eq__)
+    NUM = (int, float, bool)
+    PRIM = (int, float, bool, str, bytes)
 
     def safe(x):
         t = type(x)
         return t in SAFE or t.__eq__ in PURE_EQ
 
-    NUM = (int, float, bool)
-    PRIM = (int, float, bool, str, bytes)
-
     def observe(nid, a, b, r_is=None, r_eq=None):
-        """Edit-agnostic observation of one evaluation: identity, equality, order."""
         i = (a is b) if r_is is None else r_is
-        if r_eq is None:
-            if safe(a) and safe(b):
-                try:
-                    e = a == b
-                    r_eq = e if isinstance(e, bool) else None
-                except Exception:
-                    r_eq = None
+        if r_eq is None and safe(a) and safe(b):
+            try:
+                e = a == b
+                r_eq = e if isinstance(e, bool) else None
+            except Exception:
+                r_eq = None
         o = "u"
         ta, tb = type(a), type(b)
         if ta in PRIM and tb in PRIM and (ta is tb or (ta in NUM and tb in NUM)):
@@ -494,7 +480,7 @@ def _profile_shard(shard_tests, out_path):
                 o = "l" if a < b else ("g" if a > b else ("e" if a == b else "u"))
             except Exception:
                 o = "u"
-        cur.add((nid, f"{int(i)}{'u' if r_eq is None else int(r_eq)}{o}"))
+        obs[0].add((nid, f"{int(i)}{'u' if r_eq is None else int(r_eq)}{o}"))
 
     def brc(nid, op, a, b):
         if op == 0:
@@ -548,151 +534,52 @@ def _profile_shard(shard_tests, out_path):
         rel = os.path.relpath(path, ROOT)
         with open(path, "rb") as f:
             src = f.read()
-        tree = ast.parse(src, path)
-        tree = ast.fix_missing_locations(T(rel).visit(tree))
+        tree = ast.fix_missing_locations(T(rel).visit(ast.parse(src, path)))
         return compile(tree, path, "exec", dont_inherit=True)
 
     ibe.SourceFileLoader.get_code = get_code
-
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from br.runner import _sync_executor
-
-    sync = _sync_executor()
-    by_class, order = {}, []
-    if os.environ.get("BR_VPROF_REVERSE") == "1":
-        shard_tests = list(reversed(shard_tests))
-    for t in shard_tests:
-        path, cls, meth = t["id"].split("::")
-        key = (path[:-3].replace("/", "."), cls)
-        if key not in by_class:
-            by_class[key] = []
-            order.append(key)
-        by_class[key].append((t["number"], meth))
-    flags = {}
-    bad = 0  # mask of tests that failed under instrumentation
-    for mod, cls in order:
-        try:
-            __import__(mod)
-            m = sys.modules[mod]
-            if hasattr(m, "ProcessPoolExecutor"):
-                m.ProcessPoolExecutor = sync
-            klass = getattr(m, cls)
-            cur.clear()
-            klass.setUpClass()
-        except BaseException:
-            continue
-        cls_flags = set(cur)
-        for num, meth in by_class[(mod, cls)]:
-            cur.clear()
-            cur.update(cls_flags)
-            res = unittest.TestResult()
-            try:
-                klass(meth).run(res)
-            except BaseException:
-                pass
-            bit = 1 << num
-            if res.errors or res.failures:
-                bad |= bit
-            for k in cur:
-                flags[k] = flags.get(k, 0) | bit
-        try:
-            klass.tearDownClass()
-            klass.doClassCleanups()
-        except BaseException:
-            pass
-    with open(out_path, "wb") as f:
-        pickle.dump((nodes, flags, bad), f)
+    return nodes
 
 
-def value_profile_pass():
-    """Two independent runs (different hash seed and test order). Comparisons whose
-    observations differ between the runs are unstable and get no reduction."""
-    import subprocess
-
-    runs = []
-    for seed, rev in (("11", "0"), ("29", "1")):
-        out = OUT + f".vprof{seed}"
-        env = dict(os.environ, PYTHONHASHSEED=seed, BR_VPROF_REVERSE=rev)
-        r = subprocess.run([sys.executable, os.path.abspath(__file__), ROOT, sys.argv[2], OUT, str(SHARDS),
-                            "--vprof-run", out], env=env)
-        if r.returncode != 0 or not os.path.exists(out):
-            return None
-        with open(out, "rb") as f:
-            runs.append(pickle.load(f))
-        os.remove(out)
-    if any(x is None for x in runs):
-        return None
-    print(f"value profile: untrusted tests {bin(runs[0]['bad'] | runs[1]['bad']).count('1')}", file=sys.stderr)
-    a, b = runs
-    # tests that failed under instrumentation in either run are untrusted: they are
-    # kept for every comparison change ("uuu" can never prove agreement)
-    untrusted = a["bad"] | b["bad"]
+def merge_vprof(fwd, rev, nodes):
+    """Comparison observations from two runs (different hash seed and test order).
+    Comparisons whose observations differ are unstable and get no reduction; tests
+    that failed under instrumentation are untrusted and always kept."""
+    untrusted = 0
+    for pt in (fwd, rev):
+        for num, v in pt.items():
+            if not v[4]:
+                untrusted |= 1 << num
     if bin(untrusted).count("1") > 20:
         return None
-    nodes = a["nodes"] & b["nodes"]
-    unstable = set()
-    keys = set(a["flags"]) | set(b["flags"])
-    for k in keys:
-        fa = {lab: m & ~untrusted for lab, m in a["flags"].get(k, {}).items()}
-        fb = {lab: m & ~untrusted for lab, m in b["flags"].get(k, {}).items()}
-        if {x: y for x, y in fa.items() if y} != {x: y for x, y in fb.items() if y}:
-            unstable.add(k)
-    nodes = frozenset(n for n in nodes if n not in unstable)
-    flags = {}
+
+    def flags(pt):
+        out = {}
+        for num, v in pt.items():
+            bit = 1 << num
+            for key, lab in v[6]:
+                d = out.setdefault(key, {})
+                d[lab] = d.get(lab, 0) | bit
+        return out
+
+    fa, fb = flags(fwd), flags(rev)
+    stable = set()
     for k in nodes:
-        d = dict(a["flags"].get(k, {}))
-        for lab, m in b["flags"].get(k, {}).items():
-            d[lab] = d.get(lab, 0) | m
+        a = {l: m & ~untrusted for l, m in fa.get(k, {}).items()}
+        b = {l: m & ~untrusted for l, m in fb.get(k, {}).items()}
+        if {l: m for l, m in a.items() if m} == {l: m for l, m in b.items() if m}:
+            stable.add(k)
+    obs = {}
+    for k in stable:
+        d = dict(fa.get(k, {}))
+        for l, m in fb.get(k, {}).items():
+            d[l] = d.get(l, 0) | m
         if untrusted:
             d["uuu"] = d.get("uuu", 0) | untrusted
-        flags[k] = d
-    print(f"value profile: {len(nodes)} stable comparisons ({len(unstable)} unstable dropped)", file=sys.stderr)
-    return {"nodes": nodes, "obs": flags}
-
-
-def value_profile_run(out_path):
-    shards = [[] for _ in range(SHARDS)]
-    loads = [0.0] * SHARDS
-    groups = {}
-    for t in TESTS:
-        groups.setdefault(t["id"].rsplit("::", 1)[0], []).append(t)
-    for key, ts in sorted(groups.items(), key=lambda kv: -sum(t["seconds"] for t in kv[1])):
-        j = loads.index(min(loads))
-        shards[j].extend(ts)
-        loads[j] += sum(t["seconds"] for t in ts)
-    tmp = OUT + ".vshard"
-    pids = []
-    for i, sh in enumerate(shards):
-        pid = os.fork()
-        if pid == 0:
-            try:
-                _profile_shard(sh, f"{tmp}{i}")
-            finally:
-                os._exit(0)
-        pids.append(pid)
-    for pid in pids:
-        os.waitpid(pid, 0)
-    prof = {}
-    instrumented = set()
-    bad = 0
-    try:
-        for i in range(SHARDS):
-            with open(f"{tmp}{i}", "rb") as f:
-                nodes, flags, b = pickle.load(f)
-            os.remove(f"{tmp}{i}")
-            bad |= b
-            instrumented.update(nodes)
-            for (nid, label), mask in flags.items():
-                d = prof.setdefault(nodes[nid], {})
-                d[label] = d.get(label, 0) | mask
-    except FileNotFoundError:
-        with open(out_path, "wb") as f:
-            pickle.dump(None, f)
-        return
-    print(f"value profile run: {len(instrumented)} comparisons, {bin(bad).count('1')} tests failed", file=sys.stderr)
-    res = {"nodes": frozenset(instrumented), "flags": prof, "bad": bad}
-    with open(out_path, "wb") as f:
-        pickle.dump(res, f)
+        obs[k] = d
+    print(f"value profile: {len(stable)} stable of {len(nodes)} comparisons, "
+          f"{bin(untrusted).count('1')} untrusted tests", file=sys.stderr)
+    return {"nodes": frozenset(stable), "obs": obs}
 
 
 def timing_pass():
@@ -762,24 +649,42 @@ def main():
             os.waitpid(pid, 0)
         per_test = {}
         import_lines = {}
+        nodes = None
         for i in range(SHARDS):
             with open(f"{tmp}{i}", "rb") as f:
-                pt, il = pickle.load(f)
+                pt, il, nd = pickle.load(f)
                 per_test.update(pt)
                 for k, v in il.items():
                     import_lines.setdefault(k, set()).update(v)
+                nodes = nd if nodes is None else nodes | nd
             os.remove(f"{tmp}{i}")
-        return per_test, import_lines
+        return per_test, import_lines, nodes
 
-    per_test, import_lines = collect(False)
+    if REVERSE_ONLY[0]:
+        res = collect(True)
+        with open(REVERSE_ONLY[0], "wb") as f:
+            pickle.dump(res, f)
+        return
+
+    per_test, import_lines, fwd_nodes = collect(False)
     order_dep = {}
     fwd_s = time.monotonic() - T0
     print(f"forward pass {fwd_s:.0f}s", file=sys.stderr)
     if os.environ.get("BR_BOTH", "1") == "1" and fwd_s * 2.2 < BUDGET:
         # Second pass in reverse order: lines whose test set changes depend on
         # run-once state (caches, lazy loading) and are flagged.
-        rev_tests, rev_imports = collect(True)
+        # reverse pass in a fresh interpreter with a different hash seed
+        import subprocess
+
+        rout = OUT + ".reverse"
+        env = dict(os.environ, PYTHONHASHSEED="29" if os.environ.get("PYTHONHASHSEED") != "29" else "31")
+        subprocess.run([sys.executable, os.path.abspath(__file__), ROOT, sys.argv[2], OUT, str(SHARDS),
+                        "--reverse-only", rout], env=env, check=True)
+        with open(rout, "rb") as f:
+            rev_tests, rev_imports, rev_nodes = pickle.load(f)
+        os.remove(rout)
         order_dep_ran[0] = True
+        VPROF[0] = merge_vprof(per_test, rev_tests, fwd_nodes & rev_nodes)
 
         def line_sets(pt):
             out = {}
@@ -810,10 +715,8 @@ def main():
                     cases[k] = (cases[k][0] | ls, cases[k][1] | cs)
                 else:
                     cases[k] = (ls, cs)
-            per_test[num] = (fwd[0] | v[0], fwd[1] | v[1], fwd[2] | v[2], cases, fwd[4], fwd[5])
+            per_test[num] = (fwd[0] | v[0], fwd[1] | v[1], fwd[2] | v[2], cases, fwd[4] and v[4], fwd[5], fwd[6])
 
-    # value profile only when the order-dependence pass ran (same robustness bar)
-    VPROF[0] = value_profile_pass() if (order_dep_ran[0] and time.monotonic() - T0 < BUDGET * 0.55) else None
     imp = {}
     for (r, l), v in import_lines.items():
         imp.setdefault(r, {})[l] = frozenset(v)
@@ -826,7 +729,8 @@ def main():
     lines, classes, files = {}, {}, {}
     cases = {}
     bad = []
-    for num, (ls, cs, fs, segcases, ok, dt) in per_test.items():
+    for num, v in per_test.items():
+        ls, cs, fs, segcases, ok, dt = v[:6]
         bit = 1 << num
         if not ok:
             bad.append(TESTS[num]["id"])
@@ -873,7 +777,7 @@ def main():
             "order_dep": {f: frozenset(v) for f, v in order_dep.items()},
             # seconds per test in the real runner (no tracing): relative CPU cost
             "vprof": VPROF[0],
-            "cost": timing_pass() if time.monotonic() - T0 < BUDGET * 0.75 else {},
+            "cost": timing_pass() if time.monotonic() - T0 < BUDGET * 0.7 else {},
             "ids": [t["id"] for t in TESTS]}
     with open(OUT, "wb") as f:
         pickle.dump(data, f, protocol=5)
@@ -886,7 +790,6 @@ def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 6 and sys.argv[5] == "--vprof-run":
-        value_profile_run(sys.argv[6])
-    else:
-        main()
+    if len(sys.argv) > 6 and sys.argv[5] == "--reverse-only":
+        REVERSE_ONLY[0] = sys.argv[6]
+    main()

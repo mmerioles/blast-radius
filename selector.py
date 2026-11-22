@@ -297,6 +297,10 @@ def verify(tests, plan, root, deadline, an=None):
             return set(order) | set(plan.giants_to_include(set())) | probe_only(tests, plan, root, deadline, an, set(order))
 
     ids = [(i, tests[i]["id"], 4.0 + 6.0 * sec[i], specs[i]) for i in order]
+    # per-commit budget: a patch that slows everything down must not eat the run;
+    # whatever is left unverified at the budget is included blind
+    budget = max(8.0, 3.0 * sum(est.values()) * cpu_factor() + 2.0)
+    deadline = min(deadline, time.monotonic() + budget)
     probe_fail = set()
     res = runner.run(root, ids, deadline=deadline, on_result=on_result,
                      probes=sorted(plan.probes), on_probe=probe_fail.add)
